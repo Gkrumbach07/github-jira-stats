@@ -113,6 +113,7 @@ python sprint_analytics.py "Sprint in (123, 124, 125)" --csv-export --csv-output
 **Output Files:**
 - `overall_metrics_{bucket_type}.csv`: Overall team metrics over time
 - `user_{username}_{bucket_type}.csv`: Individual user metrics over time
+- `summary_metrics.csv`: **NEW!** Overall metrics in first row, per-user metrics in subsequent rows (not time-bucketed)
 
 **CSV Columns Include:**
 - Time period information
@@ -122,12 +123,22 @@ python sprint_analytics.py "Sprint in (123, 124, 125)" --csv-export --csv-output
 - **Jira workflow metrics** (In Progress → PR Created, PR Merged → Resolved)
 - Review metrics (comments, LGTMs, reviewer counts)
 
-**Example CSV Data:**
+**Example Time-Bucketed CSV Data:**
 ```csv
 time_period,total_prs,merged_prs,avg_time_to_merge_hours,avg_in_progress_to_pr_created_hours
 2024-01,23,21,48.2,12.5
 2024-02,19,18,36.8,8.3
 2024-03,27,25,52.1,15.2
+```
+
+**Example Summary CSV Data:**
+```csv
+user,total_prs,merged_prs,merge_rate,avg_pr_size,avg_time_to_merge_hours,avg_time_to_first_review_hours
+OVERALL,67,58,86.5,245.3,18.5,4.2
+john.doe,23,20,87.0,234.1,19.2,4.5
+jane.smith,18,15,83.3,267.8,17.3,3.9
+alice.dev,12,11,91.7,189.2,16.8,4.8
+bob.engineer,14,12,85.7,298.4,20.1,3.7
 ```
 
 ### Why Use uv?

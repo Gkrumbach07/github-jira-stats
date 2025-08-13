@@ -158,21 +158,19 @@ class TimeBucket:
             end_date = datetime.now(pytz.UTC)
             start_date = end_date - timedelta(days=30)
         else:
-            # Find min/max dates from all PRs (created, merged, jira transitions)
-            all_dates = []
+            # Find min/max dates from PR GitHub activity only (NOT old Jira workflow dates)
+            pr_activity_dates = []
             for pr in prs:
-                all_dates.append(pr.created_at)
+                pr_activity_dates.append(pr.created_at)
                 if pr.merged_at:
-                    all_dates.append(pr.merged_at)
+                    pr_activity_dates.append(pr.merged_at)
                 if pr.first_review_at:
-                    all_dates.append(pr.first_review_at)
-                if pr.jira_in_progress_at:
-                    all_dates.append(pr.jira_in_progress_at)
-                if pr.jira_resolved_at:
-                    all_dates.append(pr.jira_resolved_at)
+                    pr_activity_dates.append(pr.first_review_at)
+                # REMOVED: jira_in_progress_at and jira_resolved_at
+                # These can be much older and cause time buckets to extend way back
 
-            start_date = min(all_dates)
-            end_date = max(all_dates)
+            start_date = min(pr_activity_dates)
+            end_date = max(pr_activity_dates)
 
             # Add padding based on bucket type
             if bucket_type == "monthly":
@@ -275,24 +273,41 @@ class JiraClient:
 
             # Handle pagination if needed
             if total_issues > len(returned_issues):
-                print(
-                    f"   📄 Fetching remaining {total_issues - len(returned_issues)} issues..."
-                )
+                remaining_issues = total_issues - len(returned_issues)
+                print(f"   📄 Fetching remaining {remaining_issues} issues...")
                 all_issues = returned_issues.copy()
 
-                # Fetch remaining issues in batches
+                # Fetch remaining issues in batches with progress bar
                 start_at = len(returned_issues)
+
+                # Create progress bar for pagination
+                pagination_progress = tqdm(
+                    total=remaining_issues,
+                    desc="   🔗 Paginating Issues",
+                    unit="issue",
+                    leave=False,
+                    bar_format="   {l_bar}{bar}| {n_fmt}/{total_fmt} issues [{elapsed}<{remaining}]",
+                )
+
                 while start_at < total_issues:
                     batch_issues = self.client.jql(
                         jql_query, expand="changelog", start=start_at
                     )
                     batch_results = batch_issues.get("issues", [])
-                    all_issues.extend(batch_results)
-                    start_at += len(batch_results)
 
                     if not batch_results:  # Prevent infinite loop
                         break
 
+                    all_issues.extend(batch_results)
+                    start_at += len(batch_results)
+
+                    # Update progress bar
+                    pagination_progress.update(len(batch_results))
+                    pagination_progress.set_postfix(
+                        {"Fetched": len(all_issues), "Batch": len(batch_results)}
+                    )
+
+                pagination_progress.close()
                 print(f"   ✅ Retrieved {len(all_issues)} total issues")
                 return all_issues
             else:
@@ -887,6 +902,14 @@ class PRAnalyzer:
         time_bucket_metrics = {}
 
         if all_prs:
+            # Debug: Show actual PR date range being used for time bucketing
+            actual_pr_dates = [pr.created_at for pr in all_prs]
+            actual_oldest = min(actual_pr_dates).strftime("%Y-%m-%d %H:%M")
+            actual_newest = max(actual_pr_dates).strftime("%Y-%m-%d %H:%M")
+            print(
+                f"🔍 Creating time buckets from FILTERED PR dates: {actual_oldest} to {actual_newest}"
+            )
+
             time_bucket_config = TimeBucket.from_prs_and_config(
                 all_prs, time_bucket_type, time_bucket_size
             )
@@ -898,6 +921,21 @@ class PRAnalyzer:
             time_bucket_metrics = self._calculate_time_bucket_metrics(
                 all_prs, time_bucket_config
             )
+
+            # Debug: Show which buckets actually have data
+            non_empty_buckets = []
+            for label in time_bucket_metrics.keys():
+                pr_count = len(
+                    [
+                        pr
+                        for pr in all_prs
+                        if time_bucket_config.get_bucket_for_date(pr.created_at)
+                        == label
+                    ]
+                )
+                if pr_count > 0:
+                    non_empty_buckets.append((label, pr_count))
+            print(f"🗂️  Time buckets with PR data: {non_empty_buckets}")
 
         calculation_steps = ["overall metrics", "per-user metrics", "final report"]
         calc_progress = tqdm(
@@ -1246,7 +1284,119 @@ class PRAnalyzer:
 
 
 class CSVExporter:
-    """Export time-bucketed analytics to CSV files"""
+    """Export analytics to CSV files"""
+
+    @staticmethod
+    def export_summary_metrics(
+        overall_metrics: Dict[str, Any],
+        per_user_metrics: Dict[str, Dict[str, Any]],
+        output_dir: str = "csv_exports",
+    ) -> str:
+        """Export summary metrics to CSV with overall in first row and users in subsequent rows
+
+        Returns:
+            Path to the created summary CSV file
+        """
+        # Create output directory
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+
+        # Define column headers
+        columns = [
+            "user",
+            "total_prs",
+            "merged_prs",
+            "merge_rate",
+            "avg_pr_size",
+            "total_comments",
+            "total_lgtms",
+            "unique_reviewers",
+            "avg_reviewers_per_pr",
+            "avg_time_to_merge_hours",
+            "avg_time_to_first_review_hours",
+            "avg_in_progress_to_pr_created_hours",
+            "avg_in_progress_to_pr_merged_hours",
+            "avg_pr_merged_to_resolved_hours",
+        ]
+
+        # Prepare data rows
+        data_rows = []
+
+        # First row: Overall metrics
+        if overall_metrics:
+            total_prs = overall_metrics.get("total_pr_count", 0)
+            merged_prs = overall_metrics.get("merged_pr_count", 0)
+            merge_rate = (merged_prs / total_prs * 100) if total_prs > 0 else 0
+
+            overall_row = {
+                "user": "OVERALL",
+                "total_prs": total_prs,
+                "merged_prs": merged_prs,
+                "merge_rate": merge_rate,
+                "avg_pr_size": overall_metrics.get("avg_pr_size", 0),
+                "total_comments": overall_metrics.get("total_comments", 0),
+                "total_lgtms": overall_metrics.get("total_lgtm_count", 0),
+                "unique_reviewers": len(
+                    overall_metrics.get("reviewer_distribution", {})
+                ),
+                "avg_reviewers_per_pr": overall_metrics.get("avg_reviewers_per_pr", 0),
+                "avg_time_to_merge_hours": overall_metrics.get("avg_time_to_merge", 0),
+                "avg_time_to_first_review_hours": overall_metrics.get(
+                    "avg_time_to_first_review", 0
+                ),
+                "avg_in_progress_to_pr_created_hours": overall_metrics.get(
+                    "avg_time_in_progress_to_pr_created", 0
+                ),
+                "avg_in_progress_to_pr_merged_hours": overall_metrics.get(
+                    "avg_time_in_progress_to_pr_merged", 0
+                ),
+                "avg_pr_merged_to_resolved_hours": overall_metrics.get(
+                    "avg_time_pr_merged_to_resolved", 0
+                ),
+            }
+            data_rows.append(overall_row)
+
+        # Subsequent rows: Per-user metrics
+        for user, user_metrics in per_user_metrics.items():
+            if user_metrics:
+                total_prs = user_metrics.get("total_pr_count", 0)
+                merged_prs = user_metrics.get("merged_pr_count", 0)
+                merge_rate = (merged_prs / total_prs * 100) if total_prs > 0 else 0
+
+                user_row = {
+                    "user": user,
+                    "total_prs": total_prs,
+                    "merged_prs": merged_prs,
+                    "merge_rate": merge_rate,
+                    "avg_pr_size": user_metrics.get("avg_pr_size", 0),
+                    "total_comments": user_metrics.get("total_comments_received", 0),
+                    "total_lgtms": user_metrics.get("total_lgtm_count", 0),
+                    "unique_reviewers": len(
+                        user_metrics.get("reviewer_distribution", {})
+                    ),
+                    "avg_reviewers_per_pr": user_metrics.get("avg_reviewers_per_pr", 0),
+                    "avg_time_to_merge_hours": user_metrics.get("avg_time_to_merge", 0),
+                    "avg_time_to_first_review_hours": user_metrics.get(
+                        "avg_time_to_first_review", 0
+                    ),
+                    "avg_in_progress_to_pr_created_hours": user_metrics.get(
+                        "avg_time_in_progress_to_pr_created", 0
+                    ),
+                    "avg_in_progress_to_pr_merged_hours": user_metrics.get(
+                        "avg_time_in_progress_to_pr_merged", 0
+                    ),
+                    "avg_pr_merged_to_resolved_hours": user_metrics.get(
+                        "avg_time_pr_merged_to_resolved", 0
+                    ),
+                }
+                data_rows.append(user_row)
+
+        # Create DataFrame and export
+        df = pd.DataFrame(data_rows, columns=columns)
+        summary_file = output_path / "summary_metrics.csv"
+        df.to_csv(summary_file, index=False)
+
+        return str(summary_file)
 
     @staticmethod
     def export_time_bucketed_data(
@@ -2038,10 +2188,26 @@ def main():
                         all_prs, time_bucket, csv_output_dir
                     )
 
-                    print(f"   ✅ CSV export complete!")
+                    print(f"   ✅ Time-bucketed CSV export complete!")
                     print(f"   📁 Files created:")
                     for file_type, file_path in csv_files.items():
                         print(f"      {file_type}: {file_path}")
+
+                    # Also export summary metrics CSV (overall + per-user)
+                    print(f"   📊 Creating summary metrics CSV...")
+                    try:
+                        overall_metrics = results.get("overall_metrics", {})
+                        per_user_metrics = results.get("per_user_metrics", {})
+
+                        summary_file = CSVExporter.export_summary_metrics(
+                            overall_metrics, per_user_metrics, csv_output_dir
+                        )
+
+                        print(f"   ✅ Summary CSV export complete!")
+                        print(f"      summary: {summary_file}")
+
+                    except Exception as e:
+                        print(f"   ❌ Summary CSV export failed: {e}")
 
             except Exception as e:
                 print(f"   ❌ CSV export failed: {e}")

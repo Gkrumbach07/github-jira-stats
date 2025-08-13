@@ -104,6 +104,17 @@ def main():
                 print(f"✅ Monthly CSV files created:")
                 for file_type, file_path in monthly_csv_files.items():
                     print(f"   {file_type}: {file_path}")
+
+                # Also demonstrate summary CSV export
+                print(f"\n📋 Creating summary metrics CSV (overall + per-user)...")
+                overall_metrics = results.get("overall_metrics", {})
+                per_user_metrics = results.get("per_user_metrics", {})
+
+                summary_csv_file = CSVExporter.export_summary_metrics(
+                    overall_metrics, per_user_metrics, "example_csv_exports"
+                )
+
+                print(f"✅ Summary CSV created: {summary_csv_file}")
             else:
                 print("⚠️  No PR data available for CSV export")
 
