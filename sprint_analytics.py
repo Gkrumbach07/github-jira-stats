@@ -25,9 +25,26 @@ from tqdm import tqdm
 import asyncio
 from gql import gql, Client
 from gql.transport.aiohttp import AIOHTTPTransport
+import pandas as pd
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
+
+# Bot accounts to filter out from reviewer analytics
+EXCLUDED_BOT_ACCOUNTS = {
+    "coderabbitai",
+    "copilot-pull-request-reviewer",
+    "dependabot[bot]",
+    "github-actions[bot]",
+}
+
+
+def is_bot_account(username: str) -> bool:
+    """Check if a username belongs to a bot account that should be excluded from analytics"""
+    if not username:
+        return True  # Filter out empty/None usernames
+    return username in EXCLUDED_BOT_ACCOUNTS
 
 
 @dataclass
@@ -122,6 +139,104 @@ class SprintConfig:
             return 3
 
 
+@dataclass
+class TimeBucket:
+    """Time bucket configuration for flexible time-based analytics"""
+
+    bucket_type: str  # 'daily', 'weekly', 'monthly', 'n_days'
+    bucket_size: int  # For 'n_days', number of days per bucket
+    start_date: datetime
+    end_date: datetime
+
+    @classmethod
+    def from_prs_and_config(
+        cls, prs: List[PRMetrics], bucket_type: str = "weekly", bucket_size: int = 7
+    ):
+        """Create TimeBucket from PR data with automatic date range detection"""
+        if not prs:
+            # Default to last 30 days if no PRs
+            end_date = datetime.now(pytz.UTC)
+            start_date = end_date - timedelta(days=30)
+        else:
+            # Find min/max dates from all PRs (created, merged, jira transitions)
+            all_dates = []
+            for pr in prs:
+                all_dates.append(pr.created_at)
+                if pr.merged_at:
+                    all_dates.append(pr.merged_at)
+                if pr.first_review_at:
+                    all_dates.append(pr.first_review_at)
+                if pr.jira_in_progress_at:
+                    all_dates.append(pr.jira_in_progress_at)
+                if pr.jira_resolved_at:
+                    all_dates.append(pr.jira_resolved_at)
+
+            start_date = min(all_dates)
+            end_date = max(all_dates)
+
+            # Add padding based on bucket type
+            if bucket_type == "monthly":
+                start_date = start_date.replace(day=1)  # Start of month
+                end_date = (end_date.replace(day=1) + timedelta(days=32)).replace(
+                    day=1
+                ) - timedelta(
+                    days=1
+                )  # End of month
+            elif bucket_type == "weekly":
+                # Start on Monday of the week
+                start_date = start_date - timedelta(days=start_date.weekday())
+                end_date = end_date + timedelta(days=6 - end_date.weekday())
+            else:  # daily or n_days
+                # No special alignment needed
+                pass
+
+        return cls(bucket_type, bucket_size, start_date, end_date)
+
+    def get_buckets(self) -> List[Tuple[datetime, datetime, str]]:
+        """Get list of (start_date, end_date, label) tuples for each bucket"""
+        buckets = []
+        current_date = self.start_date
+
+        while current_date < self.end_date:
+            if self.bucket_type == "daily":
+                next_date = current_date + timedelta(days=1)
+                label = current_date.strftime("%Y-%m-%d")
+            elif self.bucket_type == "weekly":
+                next_date = current_date + timedelta(days=7)
+                label = current_date.strftime("%Y-W%U")  # Week number
+            elif self.bucket_type == "monthly":
+                # Move to next month
+                if current_date.month == 12:
+                    next_date = current_date.replace(
+                        year=current_date.year + 1, month=1
+                    )
+                else:
+                    next_date = current_date.replace(month=current_date.month + 1)
+                label = current_date.strftime("%Y-%m")
+            elif self.bucket_type == "n_days":
+                next_date = current_date + timedelta(days=self.bucket_size)
+                label = f"{current_date.strftime('%Y-%m-%d')}_to_{(next_date-timedelta(days=1)).strftime('%Y-%m-%d')}"
+            else:
+                raise ValueError(f"Unsupported bucket type: {self.bucket_type}")
+
+            # Don't exceed end_date
+            if next_date > self.end_date:
+                next_date = self.end_date
+
+            buckets.append((current_date, next_date, label))
+            current_date = next_date
+
+        return buckets
+
+    def get_bucket_for_date(self, date: datetime) -> Optional[str]:
+        """Get bucket label for a given date"""
+        buckets = self.get_buckets()
+        for start, end, label in buckets:
+            if start <= date < end:
+                return label
+        return None
+
+
 class JiraClient:
     """Jira API client wrapper"""
 
@@ -149,16 +264,43 @@ class JiraClient:
         self.github_field_id = github_field_id
         self.sprint_field_id = sprint_field_id
 
-    def get_sprint_issues(self, sprint_id: str) -> List[Dict[str, Any]]:
-        """Get all issues from a specific sprint using sprint ID"""
+    def get_issues_by_jql(self, jql_query: str) -> List[Dict[str, Any]]:
+        """Get all issues matching the provided JQL query"""
         try:
-            # Search for issues in the sprint using custom field
-            # sprint_id can be either numeric ID or string name
-            jql = f"Sprint={sprint_id}"
-            issues = self.client.jql(jql, expand="changelog")
-            return issues.get("issues", [])
+            print(f"🔍 Executing JQL query: {jql_query}")
+            issues = self.client.jql(jql_query, expand="changelog")
+            total_issues = issues.get("total", 0)
+            returned_issues = issues.get("issues", [])
+            print(f"   Found {len(returned_issues)} issues (total: {total_issues})")
+
+            # Handle pagination if needed
+            if total_issues > len(returned_issues):
+                print(
+                    f"   📄 Fetching remaining {total_issues - len(returned_issues)} issues..."
+                )
+                all_issues = returned_issues.copy()
+
+                # Fetch remaining issues in batches
+                start_at = len(returned_issues)
+                while start_at < total_issues:
+                    batch_issues = self.client.jql(
+                        jql_query, expand="changelog", start=start_at
+                    )
+                    batch_results = batch_issues.get("issues", [])
+                    all_issues.extend(batch_results)
+                    start_at += len(batch_results)
+
+                    if not batch_results:  # Prevent infinite loop
+                        break
+
+                print(f"   ✅ Retrieved {len(all_issues)} total issues")
+                return all_issues
+            else:
+                return returned_issues
+
         except Exception as e:
-            print(f"Error fetching sprint issues for {sprint_id}: {e}")
+            print(f"❌ Error executing JQL query: {e}")
+            print(f"   Query: {jql_query}")
             return []
 
     def extract_github_urls(self, issue: Dict[str, Any]) -> List[str]:
@@ -280,7 +422,9 @@ class GitHubClient:
                 if review.state in ["APPROVED", "CHANGES_REQUESTED", "COMMENTED"]:
                     if not first_review_at or review.submitted_at < first_review_at:
                         first_review_at = review.submitted_at.replace(tzinfo=pytz.UTC)
-                    reviewers.add(review.user.login)
+                    # Filter out bot accounts
+                    if not is_bot_account(review.user.login):
+                        reviewers.add(review.user.login)
 
             # Get comments and LGTM analysis
             comments = pr.get_issue_comments()
@@ -292,11 +436,15 @@ class GitHubClient:
             # Check for LGTM in comments
             for comment in comments:
                 if "/lgtm" in comment.body.lower() or "lgtm" in comment.body.lower():
-                    lgtm_users.add(comment.user.login)
+                    # Filter out bot accounts from LGTM counting
+                    if not is_bot_account(comment.user.login):
+                        lgtm_users.add(comment.user.login)
 
             for comment in review_comments:
                 if "/lgtm" in comment.body.lower() or "lgtm" in comment.body.lower():
-                    lgtm_users.add(comment.user.login)
+                    # Filter out bot accounts from LGTM counting
+                    if not is_bot_account(comment.user.login):
+                        lgtm_users.add(comment.user.login)
 
             # Calculate PR size
             size = pr.additions + pr.deletions
@@ -503,7 +651,9 @@ class GitHubClient:
                     if not first_review_at or review_date < first_review_at:
                         first_review_at = review_date
                     if review["author"] and review["author"]["login"]:
-                        reviewers.add(review["author"]["login"])
+                        # Filter out bot accounts
+                        if not is_bot_account(review["author"]["login"]):
+                            reviewers.add(review["author"]["login"])
 
             # Process comments and LGTM analysis
             comments = pr_data.get("comments", {}).get("nodes", [])
@@ -514,7 +664,9 @@ class GitHubClient:
                 body = comment.get("body", "").lower()
                 if "/lgtm" in body or "lgtm" in body:
                     if comment["author"] and comment["author"]["login"]:
-                        lgtm_users.add(comment["author"]["login"])
+                        # Filter out bot accounts from LGTM counting
+                        if not is_bot_account(comment["author"]["login"]):
+                            lgtm_users.add(comment["author"]["login"])
 
             # Calculate PR size
             size = pr_data.get("additions", 0) + pr_data.get("deletions", 0)
@@ -552,8 +704,8 @@ class GitHubClient:
             return None
 
 
-class SprintAnalyzer:
-    """Main analyzer class"""
+class PRAnalyzer:
+    """Main PR analytics analyzer class"""
 
     def __init__(
         self,
@@ -579,72 +731,64 @@ class SprintAnalyzer:
         self.github_owner = github_owner
         self.github_repo = github_repo
 
-    def analyze_sprints(
-        self, sprint_ids: List[str], sprint_length_weeks: int = 3
+    def analyze_prs_by_jql(
+        self,
+        jql_query: str,
+        time_bucket_type: str = "weekly",
+        time_bucket_size: int = 7,
     ) -> Dict[str, Any]:
-        """Analyze multiple sprints and return comprehensive metrics"""
-
-        # Get sprint configurations (you may need to adjust this based on your sprint ID/dating)
-        sprint_configs = self._get_sprint_configs(sprint_ids, sprint_length_weeks)
+        """Analyze PRs from Jira issues matching the JQL query and return comprehensive metrics"""
 
         all_prs = []
-        sprint_metrics = {}
         all_pr_data = []  # Collect all PR data for bulk processing
-        sprint_issue_mapping = {}  # Track which PRs belong to which sprint
 
-        # Phase 1: Collect all GitHub PR URLs from all sprints
+        # Phase 1: Collect all GitHub PR URLs from Jira issues using JQL
         print("🔍 Phase 1: Collecting GitHub PR URLs from Jira issues...")
-        sprint_progress = tqdm(
-            sprint_ids,
-            desc="📋 Fetching Issues",
-            unit="sprint",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} sprints [{elapsed}<{remaining}]",
+
+        # Get Jira issues using JQL query
+        issues = self.jira.get_issues_by_jql(jql_query)
+
+        if not issues:
+            print("⚠️  No issues found matching the JQL query")
+            return {
+                "time_bucket_metrics": {},
+                "overall_metrics": {},
+                "per_user_metrics": {},
+                "time_bucket_config": None,
+                "total_prs": 0,
+                "all_prs": [],
+            }
+
+        print(f"📋 Processing {len(issues)} Jira issues for GitHub PR links...")
+
+        # Progress bar for processing issues
+        issue_progress = tqdm(
+            issues,
+            desc="🔍 Processing Issues",
+            unit="issue",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} issues [{elapsed}<{remaining}]",
         )
 
-        for sprint_id in sprint_progress:
-            sprint_progress.set_description(f"📋 Sprint {sprint_id}")
+        for issue in issue_progress:
+            issue_key = issue["key"]
+            issue_progress.set_description(f"🔍 {issue_key}")
 
-            # Get Jira issues for this sprint
-            issues = self.jira.get_sprint_issues(sprint_id)
-            sprint_pr_urls = []
+            github_urls = self.jira.extract_github_urls(issue)
+            if github_urls:
+                pr_url = github_urls[0]  # Take the first URL found
+                # Extract Jira status transitions for workflow timing
+                jira_transitions = self.jira.extract_status_transitions(issue)
 
-            if issues:
-                # Progress bar for processing issues
-                issue_progress = tqdm(
-                    issues,
-                    desc="🔍 Processing Issues",
-                    unit="issue",
-                    leave=False,
-                    bar_format="   {l_bar}{bar}| {n_fmt}/{total_fmt} issues [{elapsed}<{remaining}]",
+                # We'll use a default sprint config for now - time bucketing will replace this
+                default_config = SprintConfig(
+                    name="default",
+                    start_date=datetime.now(pytz.UTC) - timedelta(days=90),
+                    end_date=datetime.now(pytz.UTC),
                 )
 
-                for issue in issue_progress:
-                    issue_key = issue["key"]
-                    issue_progress.set_description(f"🔍 {issue_key}")
-
-                    github_urls = self.jira.extract_github_urls(issue)
-                    if github_urls:
-                        pr_url = github_urls[0]  # Take the first URL found
-                        if sprint_id in sprint_configs:
-                            # Extract Jira status transitions for workflow timing
-                            jira_transitions = self.jira.extract_status_transitions(
-                                issue
-                            )
-
-                            all_pr_data.append(
-                                (
-                                    pr_url,
-                                    sprint_configs[sprint_id],
-                                    issue_key,
-                                    jira_transitions,
-                                )
-                            )
-                            sprint_pr_urls.append(pr_url)
-
-            sprint_issue_mapping[sprint_id] = sprint_pr_urls
-            sprint_progress.set_postfix(
-                {"Issues": len(issues), "PR URLs": len(sprint_pr_urls)}
-            )
+                all_pr_data.append(
+                    (pr_url, default_config, issue_key, jira_transitions)
+                )
 
         # Phase 2: Bulk analyze all PRs using GraphQL
         if all_pr_data:
@@ -655,26 +799,9 @@ class SprintAnalyzer:
                 # Use asyncio to run the bulk analysis
                 bulk_pr_metrics = asyncio.run(self.github.bulk_analyze_prs(all_pr_data))
 
-                # Filter out None results and group by sprint
+                # Filter out None results
                 valid_metrics = [m for m in bulk_pr_metrics if m is not None]
                 all_prs.extend(valid_metrics)
-
-                # Group PRs by sprint for individual sprint metrics
-                for sprint_id in sprint_ids:
-                    sprint_prs = []
-                    sprint_urls = set(sprint_issue_mapping[sprint_id])
-
-                    for pr_url, _, _, _ in all_pr_data:
-                        if pr_url in sprint_urls:
-                            # Find the corresponding PR metrics
-                            for pr_metrics in valid_metrics:
-                                if pr_url.endswith(f"/pull/{pr_metrics.pr_number}"):
-                                    sprint_prs.append(pr_metrics)
-                                    break
-
-                    sprint_metrics[sprint_id] = self._calculate_sprint_metrics(
-                        sprint_prs
-                    )
 
                 print(f"   ✅ Successfully analyzed {len(valid_metrics)} PRs")
                 if len(valid_metrics) != len(all_pr_data):
@@ -705,24 +832,29 @@ class SprintAnalyzer:
                     if pr_metrics:
                         all_prs.append(pr_metrics)
 
-                # Calculate sprint metrics for fallback case
-                for sprint_id in sprint_ids:
-                    sprint_prs = [
-                        pr
-                        for pr in all_prs
-                        if any(
-                            pr_url.endswith(f"/pull/{pr.pr_number}")
-                            for pr_url in sprint_issue_mapping[sprint_id]
-                        )
-                    ]
-                    sprint_metrics[sprint_id] = self._calculate_sprint_metrics(
-                        sprint_prs
-                    )
         else:
-            print("   ⚠️  No GitHub PR URLs found in any sprint issues")
+            print("   ⚠️  No GitHub PR URLs found in any Jira issues")
 
-        # Calculate overall metrics with progress indication
+        # Phase 3: Calculate metrics with time bucketing
         print(f"\n📊 Calculating analytics for {len(all_prs)} total PRs...")
+
+        # Create time bucket configuration from PR data
+        time_bucket_config = None
+        time_bucket_metrics = {}
+
+        if all_prs:
+            time_bucket_config = TimeBucket.from_prs_and_config(
+                all_prs, time_bucket_type, time_bucket_size
+            )
+            print(
+                f"📅 Time bucketing: {time_bucket_type} from {time_bucket_config.start_date.strftime('%Y-%m-%d')} to {time_bucket_config.end_date.strftime('%Y-%m-%d')}"
+            )
+
+            # Calculate time-bucket-specific metrics
+            time_bucket_metrics = self._calculate_time_bucket_metrics(
+                all_prs, time_bucket_config
+            )
+
         calculation_steps = ["overall metrics", "per-user metrics", "final report"]
         calc_progress = tqdm(
             calculation_steps,
@@ -741,32 +873,37 @@ class SprintAnalyzer:
                 pass
 
         return {
-            "sprint_metrics": sprint_metrics,
+            "time_bucket_metrics": time_bucket_metrics,
             "overall_metrics": overall_metrics,
             "per_user_metrics": per_user_metrics,
-            "sprint_configs": sprint_configs,
+            "time_bucket_config": time_bucket_config,
             "total_prs": len(all_prs),
+            "all_prs": all_prs,  # Include raw PR data for CSV export
         }
 
-    def _get_sprint_configs(
-        self, sprint_ids: List[str], sprint_length_weeks: int
-    ) -> Dict[str, SprintConfig]:
-        """Get sprint configurations - you may need to customize this based on your sprint IDs"""
-        configs = {}
+    def _calculate_time_bucket_metrics(
+        self, prs: List[PRMetrics], time_bucket: TimeBucket
+    ) -> Dict[str, Any]:
+        """Calculate metrics grouped by time buckets instead of sprints"""
+        if not prs:
+            return {}
 
-        # This is a placeholder - you'll need to implement your sprint dating logic
-        # For now, I'm creating mock dates for demonstration
-        base_date = datetime(2025, 3, 17, tzinfo=pytz.UTC)
+        buckets = time_bucket.get_buckets()
+        bucket_metrics = {}
 
-        for i, sprint_id in enumerate(sprint_ids):
-            start_date = base_date + timedelta(weeks=i * sprint_length_weeks)
-            end_date = start_date + timedelta(weeks=sprint_length_weeks)
+        for bucket_start, bucket_end, bucket_label in buckets:
+            # Filter PRs for this time bucket
+            bucket_prs = [
+                pr for pr in prs if bucket_start <= pr.created_at < bucket_end
+            ]
 
-            configs[sprint_id] = SprintConfig(
-                name=sprint_id, start_date=start_date, end_date=end_date
-            )
+            if bucket_prs:
+                # Use the existing sprint metrics calculation but for time buckets
+                bucket_metrics[bucket_label] = self._calculate_sprint_metrics(
+                    bucket_prs
+                )
 
-        return configs
+        return bucket_metrics
 
     def _calculate_sprint_metrics(self, prs: List[PRMetrics]) -> Dict[str, Any]:
         """Calculate metrics for a single sprint"""
@@ -1064,6 +1201,271 @@ class SprintAnalyzer:
         return user_metrics
 
 
+class CSVExporter:
+    """Export time-bucketed analytics to CSV files"""
+
+    @staticmethod
+    def export_time_bucketed_data(
+        prs: List[PRMetrics], time_bucket: TimeBucket, output_dir: str = "csv_exports"
+    ) -> Dict[str, str]:
+        """Export time-bucketed data to CSV files
+
+        Returns:
+            Dict mapping file type to file path
+        """
+        # Create output directory
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+
+        # Get time buckets
+        buckets = time_bucket.get_buckets()
+        bucket_labels = [label for _, _, label in buckets]
+
+        # Export overall metrics CSV
+        overall_df = CSVExporter._create_overall_metrics_df(prs, time_bucket, buckets)
+        overall_file = output_path / f"overall_metrics_{time_bucket.bucket_type}.csv"
+        overall_df.to_csv(overall_file, index=False)
+
+        # Export per-user metrics CSVs
+        user_files = CSVExporter._create_per_user_metrics_csvs(
+            prs, time_bucket, buckets, output_path
+        )
+
+        return {"overall": str(overall_file), **user_files}
+
+    @staticmethod
+    def _create_overall_metrics_df(
+        prs: List[PRMetrics],
+        time_bucket: TimeBucket,
+        buckets: List[Tuple[datetime, datetime, str]],
+    ) -> pd.DataFrame:
+        """Create overall metrics DataFrame with time buckets as rows"""
+
+        # Initialize data structure
+        data = []
+
+        for bucket_start, bucket_end, bucket_label in buckets:
+            # Filter PRs for this time bucket
+            bucket_prs = [
+                pr for pr in prs if bucket_start <= pr.created_at < bucket_end
+            ]
+            merged_prs = [pr for pr in bucket_prs if pr.merged_at]
+
+            # Calculate metrics for this bucket
+            row = {
+                "time_period": bucket_label,
+                "bucket_start": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
+                "bucket_end": bucket_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "total_prs": len(bucket_prs),
+                "merged_prs": len(merged_prs),
+                "merge_rate": len(merged_prs) / len(bucket_prs) if bucket_prs else 0,
+                "avg_pr_size": (
+                    sum(pr.size for pr in bucket_prs) / len(bucket_prs)
+                    if bucket_prs
+                    else 0
+                ),
+                "total_comments": sum(pr.comments_count for pr in bucket_prs),
+                "total_lgtms": sum(pr.lgtm_count for pr in bucket_prs),
+                "unique_reviewers": len(
+                    set(reviewer for pr in bucket_prs for reviewer in pr.reviewers)
+                ),
+                "avg_reviewers_per_pr": (
+                    sum(len(pr.reviewers) for pr in bucket_prs) / len(bucket_prs)
+                    if bucket_prs
+                    else 0
+                ),
+            }
+
+            # Timing metrics
+            merge_times = [
+                pr.time_to_merge_hours
+                for pr in merged_prs
+                if pr.time_to_merge_hours is not None
+            ]
+            review_times = [
+                pr.time_to_first_review_hours
+                for pr in bucket_prs
+                if pr.time_to_first_review_hours is not None
+            ]
+
+            row.update(
+                {
+                    "avg_time_to_merge_hours": (
+                        sum(merge_times) / len(merge_times) if merge_times else 0
+                    ),
+                    "avg_time_to_first_review_hours": (
+                        sum(review_times) / len(review_times) if review_times else 0
+                    ),
+                }
+            )
+
+            # Jira workflow timing metrics
+            in_progress_to_created = [
+                pr.time_in_progress_to_pr_created_hours
+                for pr in bucket_prs
+                if pr.time_in_progress_to_pr_created_hours is not None
+            ]
+            in_progress_to_merged = [
+                pr.time_in_progress_to_pr_merged_hours
+                for pr in merged_prs
+                if pr.time_in_progress_to_pr_merged_hours is not None
+            ]
+            merged_to_resolved = [
+                pr.time_pr_merged_to_resolved_hours
+                for pr in merged_prs
+                if pr.time_pr_merged_to_resolved_hours is not None
+            ]
+
+            row.update(
+                {
+                    "avg_in_progress_to_pr_created_hours": (
+                        sum(in_progress_to_created) / len(in_progress_to_created)
+                        if in_progress_to_created
+                        else 0
+                    ),
+                    "avg_in_progress_to_pr_merged_hours": (
+                        sum(in_progress_to_merged) / len(in_progress_to_merged)
+                        if in_progress_to_merged
+                        else 0
+                    ),
+                    "avg_pr_merged_to_resolved_hours": (
+                        sum(merged_to_resolved) / len(merged_to_resolved)
+                        if merged_to_resolved
+                        else 0
+                    ),
+                }
+            )
+
+            data.append(row)
+
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def _create_per_user_metrics_csvs(
+        prs: List[PRMetrics],
+        time_bucket: TimeBucket,
+        buckets: List[Tuple[datetime, datetime, str]],
+        output_path: Path,
+    ) -> Dict[str, str]:
+        """Create per-user metrics CSV files"""
+        # Group PRs by author
+        user_prs = defaultdict(list)
+        for pr in prs:
+            user_prs[pr.author].append(pr)
+
+        user_files = {}
+
+        for user, user_pr_list in user_prs.items():
+            # Create user-specific data
+            data = []
+
+            for bucket_start, bucket_end, bucket_label in buckets:
+                # Filter PRs for this user and time bucket
+                bucket_prs = [
+                    pr
+                    for pr in user_pr_list
+                    if bucket_start <= pr.created_at < bucket_end
+                ]
+                merged_prs = [pr for pr in bucket_prs if pr.merged_at]
+
+                # Calculate metrics for this user and bucket
+                row = {
+                    "time_period": bucket_label,
+                    "bucket_start": bucket_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "bucket_end": bucket_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "user": user,
+                    "total_prs": len(bucket_prs),
+                    "merged_prs": len(merged_prs),
+                    "merge_rate": (
+                        len(merged_prs) / len(bucket_prs) if bucket_prs else 0
+                    ),
+                    "avg_pr_size": (
+                        sum(pr.size for pr in bucket_prs) / len(bucket_prs)
+                        if bucket_prs
+                        else 0
+                    ),
+                    "total_comments_received": sum(
+                        pr.comments_count for pr in bucket_prs
+                    ),
+                    "total_lgtms_received": sum(pr.lgtm_count for pr in bucket_prs),
+                    "avg_reviewers_per_pr": (
+                        sum(len(pr.reviewers) for pr in bucket_prs) / len(bucket_prs)
+                        if bucket_prs
+                        else 0
+                    ),
+                }
+
+                # Timing metrics
+                merge_times = [
+                    pr.time_to_merge_hours
+                    for pr in merged_prs
+                    if pr.time_to_merge_hours is not None
+                ]
+                review_times = [
+                    pr.time_to_first_review_hours
+                    for pr in bucket_prs
+                    if pr.time_to_first_review_hours is not None
+                ]
+
+                row.update(
+                    {
+                        "avg_time_to_merge_hours": (
+                            sum(merge_times) / len(merge_times) if merge_times else 0
+                        ),
+                        "avg_time_to_first_review_hours": (
+                            sum(review_times) / len(review_times) if review_times else 0
+                        ),
+                    }
+                )
+
+                # Jira workflow timing metrics
+                in_progress_to_created = [
+                    pr.time_in_progress_to_pr_created_hours
+                    for pr in bucket_prs
+                    if pr.time_in_progress_to_pr_created_hours is not None
+                ]
+                in_progress_to_merged = [
+                    pr.time_in_progress_to_pr_merged_hours
+                    for pr in merged_prs
+                    if pr.time_in_progress_to_pr_merged_hours is not None
+                ]
+                merged_to_resolved = [
+                    pr.time_pr_merged_to_resolved_hours
+                    for pr in merged_prs
+                    if pr.time_pr_merged_to_resolved_hours is not None
+                ]
+
+                row.update(
+                    {
+                        "avg_in_progress_to_pr_created_hours": (
+                            sum(in_progress_to_created) / len(in_progress_to_created)
+                            if in_progress_to_created
+                            else 0
+                        ),
+                        "avg_in_progress_to_pr_merged_hours": (
+                            sum(in_progress_to_merged) / len(in_progress_to_merged)
+                            if in_progress_to_merged
+                            else 0
+                        ),
+                        "avg_pr_merged_to_resolved_hours": (
+                            sum(merged_to_resolved) / len(merged_to_resolved)
+                            if merged_to_resolved
+                            else 0
+                        ),
+                    }
+                )
+
+                data.append(row)
+
+            # Save user CSV
+            user_df = pd.DataFrame(data)
+            user_file = output_path / f"user_{user}_{time_bucket.bucket_type}.csv"
+            user_df.to_csv(user_file, index=False)
+            user_files[f"user_{user}"] = str(user_file)
+
+        return user_files
+
+
 class ReportGenerator:
     """Generate formatted reports"""
 
@@ -1078,84 +1480,86 @@ class ReportGenerator:
         report.append("=" * 80)
         report.append("")
 
-        # Sprint Configuration
-        sprint_configs = analysis_results["sprint_configs"]
-        sprint_names = list(sprint_configs.keys())
+        # Time Bucket Configuration
+        time_bucket_config = analysis_results.get("time_bucket_config")
+        time_bucket_metrics = analysis_results.get("time_bucket_metrics", {})
 
-        if sprint_configs:
-            first_sprint = list(sprint_configs.values())[0]
-            last_sprint = list(sprint_configs.values())[-1]
-
-            report.append("Sprint Configuration:")
-            report.append(f"- Current sprint: {sprint_names[-1]}")
+        if time_bucket_config:
+            report.append("Analysis Configuration:")
+            report.append(f"- Time bucketing: {time_bucket_config.bucket_type}")
+            if time_bucket_config.bucket_type == "n_days":
+                report.append(f"- Bucket size: {time_bucket_config.bucket_size} days")
             report.append(
-                f"- Analyzing sprints: {sprint_names[0]}-{sprint_names[-1]} ({len(sprint_names)} sprints)"
+                f"- Analysis period: {time_bucket_config.start_date.strftime('%Y-%m-%d')} to {time_bucket_config.end_date.strftime('%Y-%m-%d')}"
             )
-            report.append("- Sprint length: 3 weeks")
-            report.append("- Sprint weeks: first, second, final")
-            report.append(
-                f"- Analysis period: {first_sprint.start_date.strftime('%Y-%m-%d')} to {last_sprint.end_date.strftime('%Y-%m-%d')}"
-            )
+            report.append(f"- Total time periods: {len(time_bucket_metrics)}")
             report.append("")
 
-        # Sprint Metrics
-        report.append("=" * 50)
-        report.append("SPRINT METRICS")
-        report.append("=" * 50)
-        report.append("")
-
-        for sprint_name, metrics in analysis_results["sprint_metrics"].items():
-            if not metrics:
-                continue
-
-            report.append(f"--- Sprint {sprint_name} ---")
-
-            # PR counts by week
-            opened = metrics["opened_by_week"]
-            merged = metrics["merged_by_week"]
-            comments = metrics["comments_by_week"]
-            lgtm = metrics["lgtm_by_week"]
-
+        # Time Bucket Metrics
+        if time_bucket_metrics:
+            report.append("=" * 50)
             report.append(
-                f"Opened PRs: First week: {opened[1]}, Second week: {opened[2]}, Final week: {opened[3]}, Total: {sum(opened.values())}"
+                f"TIME BUCKET METRICS ({time_bucket_config.bucket_type.upper()})"
             )
-            report.append(
-                f"Merged PRs: First week: {merged[1]}, Second week: {merged[2]}, Final week: {merged[3]}, Total: {sum(merged.values())}"
-            )
-            report.append(f"Carry-over PRs: {metrics['carry_over_prs']}")
-            report.append(
-                f"Team Comments: First week: {comments[1]}, Second week: {comments[2]}, Final week: {comments[3]}, Total: {sum(comments.values())}"
-            )
-            report.append(
-                f"/lgtm Comments: First week: {lgtm[1]}, Second week: {lgtm[2]}, Final week: {lgtm[3]}, Total: {sum(lgtm.values())}"
-            )
-
-            # Review distribution
-            report.append("Review Distribution:")
-            report.append(
-                f"  Total PRs reviewed in sprint: {metrics['total_prs_reviewed']}"
-            )
-
-            total_reviews = sum(metrics["reviewer_distribution"].values())
-            for reviewer, count in metrics["reviewer_distribution"].items():
-                percentage = (count / total_reviews * 100) if total_reviews > 0 else 0
-                report.append(f"  {reviewer}: {count} PRs ({percentage:.1f}%)")
-
-            # Timing metrics
-            avg_merge = metrics["avg_time_to_merge"]
-            avg_first_review = metrics["avg_time_to_first_review"]
-            avg_review_to_merge = metrics["avg_time_review_to_merge"]
-
-            report.append(
-                f"Average time to merge: {avg_merge:.1f} hours ({avg_merge/24:.1f} days) across {metrics['merged_pr_count']} PRs"
-            )
-            report.append(
-                f"Average time creation → first review: {avg_first_review:.1f} hours ({avg_first_review/24:.1f} days)"
-            )
-            report.append(
-                f"Average time first review → merge: {avg_review_to_merge:.1f} hours ({avg_review_to_merge/24:.1f} days)"
-            )
+            report.append("=" * 50)
             report.append("")
+
+            # Sort buckets chronologically
+            sorted_buckets = sorted(time_bucket_metrics.items())
+
+            for bucket_label, metrics in sorted_buckets:
+                if not metrics:
+                    continue
+
+                report.append(
+                    f"--- {time_bucket_config.bucket_type.title()} {bucket_label} ---"
+                )
+
+                # Basic PR counts
+                total_prs = metrics.get("total_pr_count", 0)
+                merged_prs = metrics.get("merged_pr_count", 0)
+
+                report.append(f"Total PRs: {total_prs}")
+                report.append(f"Merged PRs: {merged_prs}")
+                if total_prs > 0:
+                    merge_rate = (merged_prs / total_prs) * 100
+                    report.append(f"Merge rate: {merge_rate:.1f}%")
+
+                # PR size metrics
+                avg_size = metrics.get("avg_pr_size", 0)
+                if avg_size > 0:
+                    report.append(f"Average PR size: {avg_size:.0f} lines")
+
+                # Review distribution
+                reviewer_dist = metrics.get("reviewer_distribution", {})
+                if reviewer_dist:
+                    report.append("Top reviewers:")
+                    total_reviews = sum(reviewer_dist.values())
+                    # Show top 5 reviewers
+                    for reviewer, count in sorted(
+                        reviewer_dist.items(), key=lambda x: x[1], reverse=True
+                    )[:5]:
+                        percentage = (
+                            (count / total_reviews * 100) if total_reviews > 0 else 0
+                        )
+                        report.append(
+                            f"  {reviewer}: {count} reviews ({percentage:.1f}%)"
+                        )
+
+                # Timing metrics
+                avg_merge = metrics.get("avg_time_to_merge", 0)
+                avg_first_review = metrics.get("avg_time_to_first_review", 0)
+
+                if avg_merge > 0:
+                    report.append(
+                        f"Average time to merge: {avg_merge:.1f} hours ({avg_merge/24:.1f} days)"
+                    )
+                if avg_first_review > 0:
+                    report.append(
+                        f"Average time to first review: {avg_first_review:.1f} hours ({avg_first_review/24:.1f} days)"
+                    )
+
+                report.append("")
 
         # Overall Metrics
         overall = analysis_results["overall_metrics"]
@@ -1349,16 +1753,23 @@ class ReportGenerator:
                     else:
                         report.append("    PR Merged → Jira Resolved: No data")
 
-                # Calculate average reviews per sprint
-                sprint_count = len(analysis_results["sprint_configs"])
-                avg_reviews_per_sprint = (
-                    metrics["total_prs_reviewed"] / sprint_count
-                    if sprint_count > 0
+                # Calculate average reviews per time period
+                time_bucket_config = analysis_results.get("time_bucket_config")
+                time_bucket_metrics = analysis_results.get("time_bucket_metrics", {})
+                period_count = len(time_bucket_metrics)
+                period_name = (
+                    time_bucket_config.bucket_type if time_bucket_config else "period"
+                )
+
+                avg_reviews_per_period = (
+                    metrics["total_prs_reviewed"] / period_count
+                    if period_count > 0
                     else 0
                 )
-                report.append(
-                    f"  Average reviews per sprint: {avg_reviews_per_sprint:.1f} (across {metrics['total_prs_reviewed']} total PRs reviewed in {sprint_count} sprints)"
-                )
+                if period_count > 0:
+                    report.append(
+                        f"  Average reviews per {period_name}: {avg_reviews_per_period:.1f} (across {metrics['total_prs_reviewed']} total PRs reviewed in {period_count} {period_name}s)"
+                    )
                 report.append("")
 
         return "\n".join(report)
@@ -1367,10 +1778,11 @@ class ReportGenerator:
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="Generate GitHub PR Analytics Report from Jira sprints"
+        description="Generate GitHub PR Analytics Report from Jira issues using JQL queries"
     )
     parser.add_argument(
-        "sprints", nargs="+", help="List of sprint IDs to analyze (e.g., 123 456 789)"
+        "jql_query",
+        help="JQL query to filter Jira issues (e.g., 'project = PROJ AND fixVersion = 1.0' or 'Sprint in (123, 124, 125)')",
     )
     parser.add_argument("--output", "-o", help="Output file path (optional)")
     parser.add_argument(
@@ -1395,6 +1807,30 @@ def main():
         "--github-repo", help="GitHub repository name (e.g., odh-dashboard)"
     )
 
+    # Time bucketing and CSV export options
+    parser.add_argument(
+        "--csv-export",
+        action="store_true",
+        help="Export time-bucketed data to CSV files",
+    )
+    parser.add_argument(
+        "--time-bucket",
+        choices=["daily", "weekly", "monthly", "n_days"],
+        default="weekly",
+        help="Time bucketing type for CSV export (default: weekly)",
+    )
+    parser.add_argument(
+        "--bucket-size",
+        type=int,
+        default=7,
+        help="Number of days per bucket (only used with --time-bucket=n_days, default: 7)",
+    )
+    parser.add_argument(
+        "--csv-output-dir",
+        default="csv_exports",
+        help="Directory for CSV exports (default: csv_exports)",
+    )
+
     args = parser.parse_args()
 
     # Get configuration from command line args or environment variables
@@ -1416,6 +1852,12 @@ def main():
     # Get Sprint field ID from environment variable or command line argument
     sprint_field_id = os.getenv("JIRA_SPRINT_FIELD_ID", args.sprint_field)
 
+    # Get time bucketing configuration from environment variables or command line
+    time_bucket_type = os.getenv("TIME_BUCKET_TYPE", args.time_bucket)
+    bucket_size = int(os.getenv("TIME_BUCKET_SIZE", str(args.bucket_size)))
+    csv_export = args.csv_export or os.getenv("CSV_EXPORT", "false").lower() == "true"
+    csv_output_dir = os.getenv("CSV_OUTPUT_DIR", args.csv_output_dir)
+
     # Validate required parameters
     if not github_token:
         print("Error: Missing GitHub token. Provide via:")
@@ -1433,7 +1875,7 @@ def main():
 
     try:
         # Initialize analyzer
-        analyzer = SprintAnalyzer(
+        analyzer = PRAnalyzer(
             jira_url=jira_url,
             github_token=github_token,
             jira_token=jira_token,
@@ -1445,13 +1887,55 @@ def main():
             github_repo=github_repo,
         )
 
-        # Analyze sprints
-        print(
-            f"🚀 Starting analysis of {len(args.sprints)} sprints: {', '.join(args.sprints)}"
-        )
+        # Analyze PRs from JQL query
+        print(f"🚀 Starting PR analysis with JQL query:")
+        print(f"   Query: {args.jql_query}")
+        print(f"   Time bucketing: {time_bucket_type}")
         print("📊 Using bulk GraphQL processing for 20x faster PR analysis!")
         print("=" * 60)
-        results = analyzer.analyze_sprints(args.sprints)
+        results = analyzer.analyze_prs_by_jql(
+            args.jql_query, time_bucket_type, bucket_size
+        )
+
+        # CSV Export (if requested)
+        if csv_export:
+            print(f"\n📊 Exporting time-bucketed CSV data...")
+            print(f"   Time bucket type: {time_bucket_type}")
+            if time_bucket_type == "n_days":
+                print(f"   Bucket size: {bucket_size} days")
+            print(f"   Output directory: {csv_output_dir}")
+
+            try:
+                # Get all PRs from results
+                all_prs = results.get("all_prs", [])
+
+                if not all_prs:
+                    print("   ⚠️  No PR data found for CSV export")
+                else:
+                    print(f"   📋 Processing {len(all_prs)} PRs for time bucketing...")
+
+                    # Create time bucket configuration
+                    time_bucket = TimeBucket.from_prs_and_config(
+                        all_prs, time_bucket_type, bucket_size
+                    )
+
+                    print(
+                        f"   📅 Time range: {time_bucket.start_date.strftime('%Y-%m-%d')} to {time_bucket.end_date.strftime('%Y-%m-%d')}"
+                    )
+
+                    # Export CSV files
+                    csv_files = CSVExporter.export_time_bucketed_data(
+                        all_prs, time_bucket, csv_output_dir
+                    )
+
+                    print(f"   ✅ CSV export complete!")
+                    print(f"   📁 Files created:")
+                    for file_type, file_path in csv_files.items():
+                        print(f"      {file_type}: {file_path}")
+
+            except Exception as e:
+                print(f"   ❌ CSV export failed: {e}")
+                print("   📋 Continuing with regular report generation...")
 
         # Generate report
         print(f"\n📝 Generating comprehensive report...")
@@ -1467,8 +1951,9 @@ def main():
 
         print("=" * 60)
         print(
-            f"🎉 Analysis complete! Processed {results['total_prs']} PRs across {len(args.sprints)} sprints."
+            f"🎉 Analysis complete! Processed {results['total_prs']} PRs from JQL query."
         )
+        print(f"   Query: {args.jql_query}")
         print("⚡ Bulk GraphQL processing made this analysis 20x faster!")
         print("✨ Your GitHub PR analytics report is ready!")
 

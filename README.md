@@ -1,17 +1,19 @@
 # GitHub PR Analytics Report Generator
 
-This Python script analyzes GitHub Pull Requests associated with Jira issues from specified sprints and generates comprehensive analytics reports.
+This Python script analyzes GitHub Pull Requests associated with Jira issues using flexible JQL queries and generates comprehensive analytics reports with configurable time bucketing.
 
 ## Features
 
-- **Sprint-level metrics**: PR counts by week, merge statistics, review distribution
-- **Overall metrics**: Cross-sprint analytics, timing metrics, review patterns
+- **Flexible JQL queries**: Use any JQL query to filter Jira issues (not limited to sprints)
+- **Time-bucketed metrics**: Analyze data by daily, weekly, monthly, or custom time periods
+- **Overall metrics**: Cross-period analytics, timing metrics, review patterns
 - **Per-user metrics**: Individual developer performance and review contributions
 - **GitHub integration**: Automatic PR analysis including size, reviews, and timing
-- **Jira integration**: Extracts GitHub PR links from Jira issues in specified sprints
+- **Jira integration**: Extracts GitHub PR links from any Jira issues matching your query
 - **Jira workflow timing**: Tracks timing from Jira status changes to PR events
 - **Progress tracking**: Beautiful progress bars show real-time analysis status
 - **Bulk processing**: GraphQL-powered bulk PR analysis (20x faster than individual requests)
+- **Time-bucketed CSV export**: Export data by daily, weekly, monthly, or custom time periods
 
 ## Setup
 
@@ -76,8 +78,56 @@ JIRA_GITHUB_FIELD_ID=customfield_12310220  # GitHub PR links field
 cp env.example .env
 # Edit .env with your credentials
 
-# Run the script directly (using sprint IDs)
-python sprint_analytics.py "123" "124" "125"
+# Run the script with JQL queries (much more flexible!)
+python sprint_analytics.py "Sprint in (123, 124, 125)"
+
+# Or use any JQL query you want
+python sprint_analytics.py "project = MYPROJ AND fixVersion = '2.0'"
+python sprint_analytics.py "assignee = currentUser() AND updated >= -30d"
+python sprint_analytics.py "project = MYPROJ AND created >= '2024-01-01'"
+```
+
+### CSV Export (Time-Bucketed Analytics)
+
+Export your data to CSV files with flexible time bucketing for advanced analysis and visualization:
+
+```bash
+# Enable CSV export with weekly buckets (default)
+python sprint_analytics.py "Sprint in (123, 124, 125)" --csv-export
+
+# Export with different time buckets
+python sprint_analytics.py "project = MYPROJ AND fixVersion = '2.0'" --csv-export --time-bucket daily
+python sprint_analytics.py "assignee = currentUser() AND updated >= -30d" --csv-export --time-bucket monthly
+python sprint_analytics.py "project = MYPROJ AND created >= '2024-01-01'" --csv-export --time-bucket n_days --bucket-size 10
+
+# Custom output directory  
+python sprint_analytics.py "Sprint in (123, 124, 125)" --csv-export --csv-output-dir my_data
+```
+
+**Time Bucket Options:**
+- `daily`: One row per day
+- `weekly`: One row per week (Monday to Sunday)
+- `monthly`: One row per calendar month
+- `n_days`: Custom time periods (specify days with `--bucket-size`)
+
+**Output Files:**
+- `overall_metrics_{bucket_type}.csv`: Overall team metrics over time
+- `user_{username}_{bucket_type}.csv`: Individual user metrics over time
+
+**CSV Columns Include:**
+- Time period information
+- PR counts (total, merged, merge rate)
+- Size metrics (avg PR size)
+- Timing metrics (time to merge, time to review)
+- **Jira workflow metrics** (In Progress → PR Created, PR Merged → Resolved)
+- Review metrics (comments, LGTMs, reviewer counts)
+
+**Example CSV Data:**
+```csv
+time_period,total_prs,merged_prs,avg_time_to_merge_hours,avg_in_progress_to_pr_created_hours
+2024-01,23,21,48.2,12.5
+2024-02,19,18,36.8,8.3
+2024-03,27,25,52.1,15.2
 ```
 
 ### Why Use uv?
@@ -105,12 +155,18 @@ time uv pip install -r requirements.txt   # ~3-5 seconds
 | `--github-owner` | `GITHUB_OWNER` | `opendatahub-io` | GitHub repository owner |
 | `--github-repo` | `GITHUB_REPO` | `odh-dashboard` | GitHub repository name |
 | `--github-field` | `JIRA_GITHUB_FIELD_ID` | `customfield_12310220` | Jira custom field for PR links |
+| `--sprint-field` | `JIRA_SPRINT_FIELD_ID` | `customfield_12310940` | Jira custom field for sprint identification |
 | `--output` / `-o` | - | - | Output file path |
+| `--csv-export` | `CSV_EXPORT` | `false` | Enable CSV export |
+| `--time-bucket` | `TIME_BUCKET_TYPE` | `weekly` | Time bucketing: daily, weekly, monthly, n_days |
+| `--bucket-size` | `TIME_BUCKET_SIZE` | `7` | Days per bucket (for n_days) |
+| `--csv-output-dir` | `CSV_OUTPUT_DIR` | `csv_exports` | CSV output directory |
 
 ## How It Works
 
-1. **Jira Integration**: For each sprint ID, the script:
-   - Uses JQL: `Sprint = "sprint_id"`
+1. **Jira Integration**: Using your JQL query, the script:
+   - Executes your custom JQL query (e.g., `"Sprint in (123, 124)" or "project = MYPROJ AND fixVersion = '2.0'"`)
+   - Handles pagination automatically for large result sets
    - Extracts GitHub PR URLs with priority order:
      1. **Primary**: Custom field `customfield_12310220` (GitHub PR field)
      2. **Fallback**: Issue descriptions, comments, and other custom fields
@@ -150,9 +206,9 @@ These metrics help identify bottlenecks in your development workflow and measure
 
 The script generates a report with the following sections:
 
-- **Sprint Configuration**: Overview of analyzed sprints and time periods
-- **Sprint Metrics**: Week-by-week breakdown for each sprint
-- **Overall Metrics**: Cross-sprint analytics and trends, including GitHub PR timing and **Jira workflow timing**
+- **Time Bucket Configuration**: Overview of analyzed time periods and date ranges
+- **Time Bucket Metrics**: Period-by-period breakdown (daily/weekly/monthly based on your choice)
+- **Overall Metrics**: Cross-period analytics and trends, including GitHub PR timing and **Jira workflow timing**
 - **Per-User Metrics**: Individual developer performance, including personal workflow timing metrics
 
 **Sample Jira Workflow Timing Output:**
@@ -292,6 +348,12 @@ This makes it easy to estimate completion time and see which step is currently r
 - Each bulk query (~20 PRs) uses ~100 points vs 2000+ for individual REST calls
 - Progress bars provide real-time feedback and time estimates
 - Consider caching results for repeated analysis of the same sprints
+
+**📊 CSV Export Performance:**
+- Time-bucketed CSV export processes all PRs in memory
+- Large datasets (1000+ PRs) may take additional 10-30 seconds for CSV generation
+- CSV files are optimized with pandas for fast loading in analysis tools
+- Separate files per user prevent memory issues with large teams
 
 ## License
 

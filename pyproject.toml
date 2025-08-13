@@ -15,6 +15,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "gql>=3.4.1",
     "aiohttp>=3.9.0",
+    "pandas>=2.0.0",
 ]
 
 [project.scripts]
