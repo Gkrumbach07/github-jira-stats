@@ -736,8 +736,16 @@ class PRAnalyzer:
         jql_query: str,
         time_bucket_type: str = "weekly",
         time_bucket_size: int = 7,
+        pr_date_filter_months: int = 6,
     ) -> Dict[str, Any]:
-        """Analyze PRs from Jira issues matching the JQL query and return comprehensive metrics"""
+        """Analyze PRs from Jira issues matching the JQL query and return comprehensive metrics
+
+        Args:
+            jql_query: JQL query to filter Jira issues
+            time_bucket_type: Type of time bucketing (daily, weekly, monthly, n_days)
+            time_bucket_size: Size for n_days bucketing
+            pr_date_filter_months: Only include PRs created within this many months ago (default: 6)
+        """
 
         all_prs = []
         all_pr_data = []  # Collect all PR data for bulk processing
@@ -835,10 +843,46 @@ class PRAnalyzer:
         else:
             print("   ⚠️  No GitHub PR URLs found in any Jira issues")
 
+        # Phase 2.5: Filter PRs by date range to avoid including irrelevant old PRs
+        if all_prs and pr_date_filter_months > 0:
+            cutoff_date = datetime.now(pytz.UTC) - timedelta(
+                days=pr_date_filter_months * 30
+            )
+            original_count = len(all_prs)
+
+            # Show PR date range before filtering for debugging
+            pr_dates = [pr.created_at for pr in all_prs]
+            oldest_pr = min(pr_dates).strftime("%Y-%m-%d")
+            newest_pr = max(pr_dates).strftime("%Y-%m-%d")
+            print(f"🔍 PR date range before filtering: {oldest_pr} to {newest_pr}")
+            print(f"   Cutoff date: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            all_prs = [pr for pr in all_prs if pr.created_at >= cutoff_date]
+            filtered_count = original_count - len(all_prs)
+
+            if filtered_count > 0:
+                print(
+                    f"🗓️  Filtered out {filtered_count} PRs older than {pr_date_filter_months} months"
+                )
+                print(f"   Remaining PRs: {len(all_prs)}")
+
+                # Show new date range after filtering
+                if all_prs:
+                    filtered_dates = [pr.created_at for pr in all_prs]
+                    oldest_filtered = min(filtered_dates).strftime("%Y-%m-%d")
+                    newest_filtered = max(filtered_dates).strftime("%Y-%m-%d")
+                    print(
+                        f"   New PR date range: {oldest_filtered} to {newest_filtered}"
+                    )
+            else:
+                print(
+                    f"🗓️  No PRs older than {pr_date_filter_months} months to filter out"
+                )
+
         # Phase 3: Calculate metrics with time bucketing
         print(f"\n📊 Calculating analytics for {len(all_prs)} total PRs...")
 
-        # Create time bucket configuration from PR data
+        # Create time bucket configuration from FILTERED PR data
         time_bucket_config = None
         time_bucket_metrics = {}
 
@@ -1518,27 +1562,36 @@ class ReportGenerator:
                 # Basic PR counts
                 total_prs = metrics.get("total_pr_count", 0)
                 merged_prs = metrics.get("merged_pr_count", 0)
+                merge_rate = (merged_prs / total_prs) * 100 if total_prs > 0 else 0
 
                 report.append(f"Total PRs: {total_prs}")
                 report.append(f"Merged PRs: {merged_prs}")
-                if total_prs > 0:
-                    merge_rate = (merged_prs / total_prs) * 100
-                    report.append(f"Merge rate: {merge_rate:.1f}%")
+                report.append(f"Merge rate: {merge_rate:.1f}%")
 
-                # PR size metrics
+                # PR size and activity metrics
                 avg_size = metrics.get("avg_pr_size", 0)
-                if avg_size > 0:
-                    report.append(f"Average PR size: {avg_size:.0f} lines")
+                total_comments = metrics.get("total_comments", 0)
+                total_lgtms = metrics.get("total_lgtm_count", 0)
 
-                # Review distribution
+                report.append(f"Average PR size: {avg_size:.0f} lines")
+                report.append(f"Total comments: {total_comments}")
+                report.append(f"Total LGTMs: {total_lgtms}")
+
+                # Review metrics
                 reviewer_dist = metrics.get("reviewer_distribution", {})
+                unique_reviewers = len(reviewer_dist)
+                avg_reviewers_per_pr = metrics.get("avg_reviewers_per_pr", 0)
+
+                report.append(f"Unique reviewers: {unique_reviewers}")
+                report.append(f"Average reviewers per PR: {avg_reviewers_per_pr:.1f}")
+
+                # Top reviewers (show top 3 for space)
                 if reviewer_dist:
                     report.append("Top reviewers:")
                     total_reviews = sum(reviewer_dist.values())
-                    # Show top 5 reviewers
                     for reviewer, count in sorted(
                         reviewer_dist.items(), key=lambda x: x[1], reverse=True
-                    )[:5]:
+                    )[:3]:
                         percentage = (
                             (count / total_reviews * 100) if total_reviews > 0 else 0
                         )
@@ -1546,18 +1599,57 @@ class ReportGenerator:
                             f"  {reviewer}: {count} reviews ({percentage:.1f}%)"
                         )
 
-                # Timing metrics
+                # GitHub timing metrics
                 avg_merge = metrics.get("avg_time_to_merge", 0)
                 avg_first_review = metrics.get("avg_time_to_first_review", 0)
 
+                report.append("GitHub PR Timing:")
                 if avg_merge > 0:
                     report.append(
-                        f"Average time to merge: {avg_merge:.1f} hours ({avg_merge/24:.1f} days)"
+                        f"  Time to merge: {avg_merge:.1f}h ({avg_merge/24:.1f}d)"
                     )
+                else:
+                    report.append("  Time to merge: No data")
+
                 if avg_first_review > 0:
                     report.append(
-                        f"Average time to first review: {avg_first_review:.1f} hours ({avg_first_review/24:.1f} days)"
+                        f"  Time to first review: {avg_first_review:.1f}h ({avg_first_review/24:.1f}d)"
                     )
+                else:
+                    report.append("  Time to first review: No data")
+
+                # Jira workflow timing metrics
+                avg_in_progress_to_created = metrics.get(
+                    "avg_time_in_progress_to_pr_created", 0
+                )
+                avg_in_progress_to_merged = metrics.get(
+                    "avg_time_in_progress_to_pr_merged", 0
+                )
+                avg_merged_to_resolved = metrics.get(
+                    "avg_time_pr_merged_to_resolved", 0
+                )
+
+                report.append("Jira Workflow Timing:")
+                if avg_in_progress_to_created > 0:
+                    report.append(
+                        f"  In Progress → PR Created: {avg_in_progress_to_created:.1f}h ({avg_in_progress_to_created/24:.1f}d)"
+                    )
+                else:
+                    report.append("  In Progress → PR Created: No data")
+
+                if avg_in_progress_to_merged > 0:
+                    report.append(
+                        f"  In Progress → PR Merged: {avg_in_progress_to_merged:.1f}h ({avg_in_progress_to_merged/24:.1f}d)"
+                    )
+                else:
+                    report.append("  In Progress → PR Merged: No data")
+
+                if avg_merged_to_resolved > 0:
+                    report.append(
+                        f"  PR Merged → Jira Resolved: {avg_merged_to_resolved:.1f}h ({avg_merged_to_resolved/24:.1f}d)"
+                    )
+                else:
+                    report.append("  PR Merged → Jira Resolved: No data")
 
                 report.append("")
 
@@ -1830,6 +1922,12 @@ def main():
         default="csv_exports",
         help="Directory for CSV exports (default: csv_exports)",
     )
+    parser.add_argument(
+        "--pr-date-filter-months",
+        type=int,
+        default=6,
+        help="Only include PRs created within this many months ago (default: 6, set to 0 to disable)",
+    )
 
     args = parser.parse_args()
 
@@ -1857,6 +1955,9 @@ def main():
     bucket_size = int(os.getenv("TIME_BUCKET_SIZE", str(args.bucket_size)))
     csv_export = args.csv_export or os.getenv("CSV_EXPORT", "false").lower() == "true"
     csv_output_dir = os.getenv("CSV_OUTPUT_DIR", args.csv_output_dir)
+    pr_date_filter_months = int(
+        os.getenv("PR_DATE_FILTER_MONTHS", str(args.pr_date_filter_months))
+    )
 
     # Validate required parameters
     if not github_token:
@@ -1891,10 +1992,19 @@ def main():
         print(f"🚀 Starting PR analysis with JQL query:")
         print(f"   Query: {args.jql_query}")
         print(f"   Time bucketing: {time_bucket_type}")
+        if pr_date_filter_months > 0:
+            print(
+                f"   PR date filter: Only PRs from last {pr_date_filter_months} months"
+            )
+        else:
+            print("   PR date filter: Disabled (includes all PRs)")
+        print(
+            f"   Current time: {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
         print("📊 Using bulk GraphQL processing for 20x faster PR analysis!")
         print("=" * 60)
         results = analyzer.analyze_prs_by_jql(
-            args.jql_query, time_bucket_type, bucket_size
+            args.jql_query, time_bucket_type, bucket_size, pr_date_filter_months
         )
 
         # CSV Export (if requested)

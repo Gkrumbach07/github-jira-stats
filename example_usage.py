@@ -52,7 +52,10 @@ def main():
         print(f"   Time bucketing: {time_bucket_type}")
         print("📊 Using bulk GraphQL processing for 20x faster PR analysis!")
         results = analyzer.analyze_prs_by_jql(
-            jql_query, time_bucket_type, time_bucket_size
+            jql_query,
+            time_bucket_type,
+            time_bucket_size,
+            pr_date_filter_months=6,  # Only analyze PRs from last 6 months
         )
 
         # Generate and display the report

@@ -161,6 +161,7 @@ time uv pip install -r requirements.txt   # ~3-5 seconds
 | `--time-bucket` | `TIME_BUCKET_TYPE` | `weekly` | Time bucketing: daily, weekly, monthly, n_days |
 | `--bucket-size` | `TIME_BUCKET_SIZE` | `7` | Days per bucket (for n_days) |
 | `--csv-output-dir` | `CSV_OUTPUT_DIR` | `csv_exports` | CSV output directory |
+| `--pr-date-filter-months` | `PR_DATE_FILTER_MONTHS` | `6` | Only include PRs created within this many months ago (0 = disable) |
 
 ## How It Works
 
@@ -282,6 +283,36 @@ jira-github-stats/
 ```
 
 ## Troubleshooting
+
+### Old PRs Showing in Recent Analysis
+
+**Problem**: Your JQL query targets recent Jira issues (e.g., "last 16 weeks") but you're seeing PR analytics going back months or years.
+
+**Cause**: Recent Jira issues can link to old GitHub PRs. Time bucketing is based on GitHub PR creation dates, not Jira issue dates.
+
+**Solution**: Use PR date filtering:
+
+```bash
+# Only analyze PRs from last 3 months (good for recent work)
+python sprint_analytics.py "project = MYPROJ AND updated >= -16w" --pr-date-filter-months 3
+
+# Only analyze PRs from last 1 month (very recent only)  
+python sprint_analytics.py "Sprint in (123, 124)" --pr-date-filter-months 1
+
+# Disable filtering to see all PRs (original behavior)
+python sprint_analytics.py "project = MYPROJ AND updated >= -16w" --pr-date-filter-months 0
+```
+
+The script will show you exactly what's being filtered:
+```
+🔍 PR date range before filtering: 2024-01-15 to 2024-08-30
+   Cutoff date: 2024-05-30 12:34:56
+🗓️  Filtered out 23 PRs older than 3 months
+   Remaining PRs: 45
+   New PR date range: 2024-05-30 to 2024-08-30
+```
+
+## Other Troubleshooting
 
 **Common Issues:**
 
