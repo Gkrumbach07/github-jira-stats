@@ -23,14 +23,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Recommended: Install dependencies only (for standalone script)
 uv pip install -r requirements.txt
-
-# Alternative: Create a virtual environment first
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -r requirements.txt
-
-# For development (adds linting, testing tools)
-uv pip install -r requirements.txt pytest black isort flake8
 ```
 
 ### 2. Configure Environment Variables
@@ -55,15 +47,6 @@ GITHUB_REPO=odh-dashboard
 
 # Jira Custom Field Configuration
 JIRA_GITHUB_FIELD_ID=customfield_12310220  # GitHub PR links field
-JIRA_SPRINT_FIELD_ID=customfield_12310940   # Sprint identification field
-```
-
-**Alternative for Jira Cloud:**
-If you're using Jira Cloud instead of on-premise, use username/password authentication:
-
-```bash
-JIRA_USERNAME=your-email@company.com
-JIRA_PASSWORD=your-jira-api-token
 ```
 
 #### Getting API Credentials
@@ -83,9 +66,6 @@ JIRA_PASSWORD=your-jira-api-token
 2. Generate a new token with `repo` permissions
 3. Copy the token (starts with `ghp_`)
 
-### 3. Customize Sprint Configuration (if needed)
-
-The script includes a `_get_sprint_configs` method that you may need to modify based on your sprint naming conventions and date calculations. Currently, it uses mock dates for demonstration.
 
 ## Usage
 
@@ -98,43 +78,6 @@ cp env.example .env
 
 # Run the script directly (using sprint IDs)
 python sprint_analytics.py "123" "124" "125"
-```
-
-### Command Line Usage (no .env file needed)
-
-```bash
-# Using token authentication for on-premise Jira (with sprint IDs)
-python sprint_analytics.py "123" "124" "125" \
-  --jira-host issues.redhat.com \
-  --jira-token YOUR_JIRA_TOKEN \
-  --github-token YOUR_GITHUB_TOKEN \
-  --github-owner opendatahub-io \
-  --github-repo odh-dashboard
-
-# Save to file
-python sprint_analytics.py "123" "124" "125" \
-  --jira-host issues.redhat.com \
-  --jira-token YOUR_JIRA_TOKEN \
-  --github-token YOUR_GITHUB_TOKEN \
-  --output report.txt
-```
-
-### Advanced Usage
-
-```bash
-# Use different custom fields for GitHub PR links and sprint identification
-python sprint_analytics.py "123" "124" \
-  --github-field customfield_10005 \
-  --sprint-field customfield_10006 \
-  --jira-token YOUR_TOKEN \
-  --github-token YOUR_TOKEN
-
-# Mix environment variables with command line overrides
-export GITHUB_TOKEN=your_token
-export JIRA_ACCESS_TOKEN=your_token
-python sprint_analytics.py "123" "124" \
-  --github-owner different-org \
-  --github-repo different-repo
 ```
 
 ### Why Use uv?
@@ -162,14 +105,12 @@ time uv pip install -r requirements.txt   # ~3-5 seconds
 | `--github-owner` | `GITHUB_OWNER` | `opendatahub-io` | GitHub repository owner |
 | `--github-repo` | `GITHUB_REPO` | `odh-dashboard` | GitHub repository name |
 | `--github-field` | `JIRA_GITHUB_FIELD_ID` | `customfield_12310220` | Jira custom field for PR links |
-| `--sprint-field` | `JIRA_SPRINT_FIELD_ID` | `customfield_12310940` | Jira custom field for sprint identification |
 | `--output` / `-o` | - | - | Output file path |
 
 ## How It Works
 
 1. **Jira Integration**: For each sprint ID, the script:
-   - Queries Jira for all issues in that sprint using custom field `customfield_12310940` 
-   - Uses JQL: `customfield_12310940 = "sprint_id"`
+   - Uses JQL: `Sprint = "sprint_id"`
    - Extracts GitHub PR URLs with priority order:
      1. **Primary**: Custom field `customfield_12310220` (GitHub PR field)
      2. **Fallback**: Issue descriptions, comments, and other custom fields
